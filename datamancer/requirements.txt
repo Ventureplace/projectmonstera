@@ -6,3 +6,7 @@ scipy>=1.7.3
 dataclasses-json>=0.6.3,<0.7.0
 colorlog>=6.5.0,<7.0.0
 pydantic
+streamlit
+openpyxl
+PyPDF2
+configparser

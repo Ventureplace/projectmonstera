@@ -5,9 +5,12 @@ import sys
 import os
 from openai import OpenAI
 import json
+from io import BytesIO
 
 # Add the parent directory to sys.path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(os.path.dirname(current_dir))
+sys.path.append(parent_dir)
 
 try:
     from datamancer.cleaner import smart_clean_extended
@@ -46,6 +49,9 @@ def generate_sql_script_ai(df: pd.DataFrame, table_name: str, db_type: str = 'sq
     if not client:
         raise ValueError("OpenAI client is not initialized. Please provide a valid API key.")
 
+    # Sanitize table name
+    table_name = ''.join(c if c.isalnum() else '_' for c in table_name)
+    
     # Prepare the data for the AI model
     column_info = df.dtypes.to_dict()
     column_info = {col: str(dtype) for col, dtype in column_info.items()}
@@ -91,18 +97,20 @@ def show():
 
     initialize_openai_client()
 
-    if 'data' not in st.session_state:
-        st.warning("Please upload data first in the 'Upload Data' page.")
+    if 'uploaded_files' not in st.session_state or not st.session_state.uploaded_files:
+        st.warning("Please upload data files first in the 'Upload Data' page.")
         return
 
-    df = st.session_state.data
+    # File selection
+    file_names = [file['name'] for file in st.session_state.uploaded_files]
+    selected_files = st.multiselect("Select files to clean:", file_names, default=[file_names[0]])
 
-    st.subheader("Original Data Preview")
-    st.write(df.head())
+    if not selected_files:
+        st.warning("Please select at least one file to clean.")
+        return
 
-    st.subheader("Data Cleaning Options")
-    
     # Cleaning options
+    st.subheader("Data Cleaning Options")
     remove_duplicates = st.checkbox("Remove duplicate rows", value=True)
     handle_missing = st.checkbox("Handle missing values", value=True)
     handle_outliers = st.checkbox("Handle outliers", value=True)
@@ -112,100 +120,128 @@ def show():
     variance_threshold = st.slider("Variance threshold for feature selection", 0.0, 1.0, 0.1, 0.01)
     skew_threshold = st.slider("Skew threshold for logarithmic transformation", 0.0, 2.0, 0.5, 0.1)
 
-    if st.button("Clean Data"):
-        with st.spinner("Cleaning data..."):
+    if st.button("Clean Selected Data"):
+        cleaned_dfs = {}
+        for file_name in selected_files:
+            file_data = next(file for file in st.session_state.uploaded_files if file['name'] == file_name)
+            df = pd.read_csv(BytesIO(file_data['content'])) if file_data['type'] == '.csv' else pd.read_excel(BytesIO(file_data['content']))
+            
+            st.subheader(f"Cleaning: {file_name}")
+            with st.spinner(f"Cleaning {file_name}..."):
+                cleaned_df = clean_dataframe(df, remove_duplicates, handle_missing, handle_outliers, normalize_data, variance_threshold, skew_threshold)
+            
+            cleaned_dfs[file_name] = cleaned_df
+            st.success(f"{file_name} cleaned successfully!")
+
+            st.subheader(f"Cleaned Data Preview: {file_name}")
+            st.write(cleaned_df.head())
+
+            st.subheader(f"Cleaning Summary: {file_name}")
+            st.write(f"Original shape: {df.shape}")
+            st.write(f"Cleaned shape: {cleaned_df.shape}")
+
             if DATAMANCER_AVAILABLE:
-                cleaned_df = smart_clean_extended(
-                    df,
-                    variance_threshold=variance_threshold,
-                    skew_threshold=skew_threshold
-                )
-            else:
-                cleaned_df = df.copy()
-                st.warning("Advanced cleaning functions are not available. Performing basic cleaning only.")
+                with st.expander(f"View Data Report: {file_name}"):
+                    report = generate_data_report(cleaned_df)
+                    st.json(report)
 
-            if remove_duplicates:
-                cleaned_df = cleaned_df.drop_duplicates()
+                with st.expander(f"View Data Insights: {file_name}"):
+                    plot_data_insights(cleaned_df)
 
-            if handle_missing:
-                for col in cleaned_df.columns:
-                    if cleaned_df[col].dtype in ['int64', 'float64']:
-                        cleaned_df[col] = cleaned_df[col].fillna(cleaned_df[col].median())
-                    else:
-                        cleaned_df[col] = cleaned_df[col].fillna(cleaned_df[col].mode()[0])
+        # Store cleaned data in session state
+        st.session_state.cleaned_data = cleaned_dfs
+        st.success("All selected files have been cleaned and stored!")
 
-            if handle_outliers:
-                for col in cleaned_df.select_dtypes(include=[np.number]).columns:
-                    Q1 = cleaned_df[col].quantile(0.25)
-                    Q3 = cleaned_df[col].quantile(0.75)
-                    IQR = Q3 - Q1
-                    cleaned_df[col] = cleaned_df[col].clip(Q1 - 1.5*IQR, Q3 + 1.5*IQR)
-
-            if normalize_data:
-                for col in cleaned_df.select_dtypes(include=[np.number]).columns:
-                    cleaned_df[col] = (cleaned_df[col] - cleaned_df[col].min()) / (cleaned_df[col].max() - cleaned_df[col].min())
-
-        st.session_state.cleaned_data = cleaned_df
-        st.success("Data cleaned successfully!")
-
-        st.subheader("Cleaned Data Preview")
-        st.write(cleaned_df.head())
-
-        st.subheader("Cleaning Summary")
-        st.write(f"Original shape: {df.shape}")
-        st.write(f"Cleaned shape: {cleaned_df.shape}")
-
-        if DATAMANCER_AVAILABLE:
-            # Generate and display data report
-            with st.expander("View Data Report"):
-                report = generate_data_report(cleaned_df)
-                st.json(report)
-
-            # Plot data insights
-            with st.expander("View Data Insights"):
-                plot_data_insights(cleaned_df)
-        else:
-            st.warning("Data report and insights are not available due to missing dependencies.")
-
+    # AI-Powered SQL Generation
     st.subheader("AI-Powered SQL Generation")
-    table_name = st.text_input("Enter table name for SQL script:", "my_table")
     db_type = st.selectbox("Select database type:", ["sqlite", "mysql", "postgresql"])
 
-    if st.button("Generate SQL Script with AI"):
+    if st.button("Generate SQL Scripts with AI"):
         if not client:
             st.error("Please enter your OpenAI API key in the text box above.")
-        elif 'cleaned_data' in st.session_state:
-            with st.spinner("Generating SQL script with AI..."):
-                try:
-                    sql_script = generate_sql_script_ai(st.session_state.cleaned_data, table_name, db_type)
-                    st.text_area("Generated SQL Script:", sql_script, height=300)
-                    
-                    # Store the SQL script in session state
-                    st.session_state.sql_script = sql_script
-                    
-                    # Option to download the SQL script
-                    st.download_button(
-                        label="Download SQL Script",
-                        data=sql_script,
-                        file_name=f"{table_name}_script.sql",
-                        mime="text/plain",
-                    )
-                except Exception as e:
-                    st.error(f"An error occurred while generating the SQL script: {str(e)}")
+        elif 'cleaned_data' in st.session_state and st.session_state.cleaned_data:
+            sql_scripts = {}
+            for file_name, cleaned_df in st.session_state.cleaned_data.items():
+                table_name = file_name.split('.')[0]  # Use filename without extension as table name
+                with st.spinner(f"Generating SQL script for {file_name}..."):
+                    try:
+                        sql_script = generate_sql_script_ai(cleaned_df, table_name, db_type)
+                        sql_scripts[file_name] = sql_script
+                        
+                        st.subheader(f"SQL Script for {file_name}")
+                        st.text_area(f"Generated SQL Script for {file_name}:", sql_script, height=200)
+                        
+                        # Option to download individual SQL script
+                        st.download_button(
+                            label=f"Download SQL Script for {file_name}",
+                            data=sql_script,
+                            file_name=f"{table_name}_script.sql",
+                            mime="text/plain",
+                        )
+                    except Exception as e:
+                        st.error(f"An error occurred while generating the SQL script for {file_name}: {str(e)}")
+            
+            # Store all SQL scripts in session state
+            st.session_state.sql_scripts = sql_scripts
+            
+            # Option to download all SQL scripts as a single file
+            if len(sql_scripts) > 1:
+                all_scripts = "\n\n-- Next Table --\n\n".join(sql_scripts.values())
+                st.download_button(
+                    label="Download All SQL Scripts",
+                    data=all_scripts,
+                    file_name="all_tables_script.sql",
+                    mime="text/plain",
+                )
         else:
-            st.warning("Please clean the data first before generating SQL script.")
+            st.warning("Please clean the data first before generating SQL scripts.")
 
-    if st.button("Download Cleaned Data"):
-        if 'cleaned_data' in st.session_state:
-            csv = st.session_state.cleaned_data.to_csv(index=False)
+    # Download options for cleaned data
+    if 'cleaned_data' in st.session_state and st.session_state.cleaned_data:
+        st.subheader("Download Cleaned Data")
+        for file_name, cleaned_df in st.session_state.cleaned_data.items():
+            csv = cleaned_df.to_csv(index=False)
             st.download_button(
-                label="Download CSV",
+                label=f"Download Cleaned {file_name}",
                 data=csv,
-                file_name="cleaned_data.csv",
+                file_name=f"cleaned_{file_name}",
                 mime="text/csv",
             )
-        else:
-            st.warning("Please clean the data first.")
+
+# Add this function to handle the cleaning process
+def clean_dataframe(df, remove_duplicates, handle_missing, handle_outliers, normalize_data, variance_threshold, skew_threshold):
+    if DATAMANCER_AVAILABLE:
+        cleaned_df = smart_clean_extended(
+            df,
+            variance_threshold=variance_threshold,
+            skew_threshold=skew_threshold
+        )
+    else:
+        cleaned_df = df.copy()
+        st.warning("Advanced cleaning functions are not available. Performing basic cleaning only.")
+
+    if remove_duplicates:
+        cleaned_df = cleaned_df.drop_duplicates()
+
+    if handle_missing:
+        for col in cleaned_df.columns:
+            if cleaned_df[col].dtype in ['int64', 'float64']:
+                cleaned_df[col] = cleaned_df[col].fillna(cleaned_df[col].median())
+            else:
+                cleaned_df[col] = cleaned_df[col].fillna(cleaned_df[col].mode()[0])
+
+    if handle_outliers:
+        for col in cleaned_df.select_dtypes(include=[np.number]).columns:
+            Q1 = cleaned_df[col].quantile(0.25)
+            Q3 = cleaned_df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            cleaned_df[col] = cleaned_df[col].clip(Q1 - 1.5*IQR, Q3 + 1.5*IQR)
+
+    if normalize_data:
+        for col in cleaned_df.select_dtypes(include=[np.number]).columns:
+            cleaned_df[col] = (cleaned_df[col] - cleaned_df[col].min()) / (cleaned_df[col].max() - cleaned_df[col].min())
+
+    return cleaned_df
 
 if __name__ == "__main__":
     show()
